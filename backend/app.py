@@ -1,19 +1,12 @@
-from flask import Flask, request, jsonify, send_file, render_template
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from dotenv import load_dotenv
 import yt_dlp
 import os
-import json
 import re
-from urllib.parse import urlparse
-import tempfile
-import threading
-import time
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import logging
-from datetime import datetime
-import requests
 from googleapiclient.discovery import build
-import subprocess
 
 # Cargar variables de entorno
 load_dotenv()
@@ -43,37 +36,8 @@ CORS(app, origins=cors_origins)
 app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key-change-in-production')
 app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_FILE_SIZE', 52428800))  # 50MB
 
-# Configuración de directorios
-DOWNLOAD_DIR = os.path.join(BASE_DIR, os.getenv('DOWNLOAD_DIR', 'downloads'))
-if not os.path.exists(DOWNLOAD_DIR):
-    os.makedirs(DOWNLOAD_DIR)
+logger.info("Aplicación iniciada (modo playlist, sin endpoints de descarga)")
 
-logger.info(f"Aplicación iniciada. Directorio de descargas: {DOWNLOAD_DIR}")
-
-# Almacenamiento temporal del progreso de descarga
-download_progress = {}
-
-class ProgressHook:
-    def __init__(self, download_id):
-        self.download_id = download_id
-        
-    def __call__(self, d):
-        if d['status'] == 'downloading':
-            percent = d.get('_percent_str', '0%').strip()
-            speed = d.get('_speed_str', 'N/A')
-            download_progress[self.download_id] = {
-                'status': 'downloading',
-                'percent': percent,
-                'speed': speed,
-                'filename': d.get('filename', '')
-            }
-        elif d['status'] == 'finished':
-            download_progress[self.download_id] = {
-                'status': 'finished',
-                'percent': '100%',
-                'speed': '0B/s',
-                'filename': d.get('filename', '')
-            }
 
 def is_valid_url(url):
     """Valida si la URL es de YouTube o TikTok"""
@@ -81,6 +45,30 @@ def is_valid_url(url):
     tiktok_pattern = r'(https?://)?(www\.|vm\.)?tiktok\.com/'
     
     return re.match(youtube_pattern, url) or re.match(tiktok_pattern, url)
+
+# === Normalizar URL de YouTube para evitar modo playlist/tab ===
+
+def normalize_url(url: str) -> str:
+    try:
+        if not url:
+            return url
+        if 'youtube.com' in url or 'youtube-nocookie.com' in url or 'youtu.be' in url:
+            parts = urlsplit(url)
+            q = dict(parse_qsl(parts.query))
+            keep = {}
+            # Mantener solo parámetros útiles para un video único
+            if 'v' in q:
+                keep['v'] = q['v']
+            if 't' in q:
+                keep['t'] = q['t']
+            # youtu.be no usa query para v
+            if parts.netloc.endswith('youtu.be'):
+                return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode({'t': keep.get('t')}) if 't' in keep else '', parts.fragment))
+            return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(keep), parts.fragment))
+        return url
+    except Exception:
+        return url
+
 
 def extract_youtube_id(url):
     """Extrae el ID del video de YouTube de una URL"""
@@ -97,6 +85,7 @@ def extract_youtube_id(url):
             return match.group(1)
     return None
 
+
 def get_youtube_info_api(video_id):
     """Obtiene información del video usando la API oficial de YouTube"""
     try:
@@ -106,14 +95,8 @@ def get_youtube_info_api(video_id):
             return None
         
         youtube = build('youtube', 'v3', developerKey=api_key)
-        
-        request = youtube.videos().list(
-            part='snippet,contentDetails,statistics',
-            id=video_id
-        )
-        
+        request = youtube.videos().list(part='snippet,contentDetails,statistics', id=video_id)
         response = request.execute()
-        
         if not response['items']:
             return None
         
@@ -137,6 +120,7 @@ def get_youtube_info_api(video_id):
         logger.error(f"Error al usar YouTube API: {str(e)}")
         return None
 
+
 def parse_duration(duration_str):
     """Convierte duración ISO 8601 (PT4M13S) a segundos"""
     import re
@@ -151,58 +135,6 @@ def parse_duration(duration_str):
     
     return hours * 3600 + minutes * 60 + seconds
 
-def try_alternative_download(url, download_id):
-    """Intenta descarga usando métodos alternativos"""
-    try:
-        # Método 1: Intentar con yt-dlp usando cookies del navegador
-        logger.info("Intentando descarga con cookies del sistema...")
-        
-        # Configuración ultra-agresiva
-        ydl_opts = {
-            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-            'format': 'best[height<=480]/worst',
-            'progress_hooks': [ProgressHook(download_id)],
-            'quiet': True,
-            'cookies_from_browser': ('chrome',),  # Usar cookies de Chrome
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['tv_embedded', 'android'],
-                    'skip': ['dash', 'hls'],
-                }
-            },
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            return True
-            
-    except Exception as e:
-        logger.warning(f"Método cookies falló: {str(e)}")
-        
-    try:
-        # Método 2: Usar cliente TV embedded (menos restrictivo)
-        logger.info("Intentando con cliente TV embedded...")
-        
-        ydl_opts = {
-            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-            'format': 'worst[height<=360]/worst',
-            'progress_hooks': [ProgressHook(download_id)],
-            'quiet': True,
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['tv_embedded'],
-                }
-            },
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-            return True
-            
-    except Exception as e:
-        logger.warning(f"Método TV embedded falló: {str(e)}")
-        
-    return False
 
 def get_ydl_opts(additional_opts=None):
     """Obtiene configuración estándar de yt-dlp con headers anti-bot avanzados"""
@@ -210,6 +142,7 @@ def get_ydl_opts(additional_opts=None):
         'quiet': True,
         'no_warnings': True,  
         'ignoreerrors': False,
+        'noplaylist': True,
         # Headers más actualizados para simular navegador real
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'referer': 'https://www.youtube.com/',
@@ -227,15 +160,13 @@ def get_ydl_opts(additional_opts=None):
             'Sec-Fetch-User': '?1',
             'Cache-Control': 'max-age=0',
         },
-        # Configuraciones más agresivas anti-bot
         'extractor_args': {
             'youtube': {
                 'skip': ['dash', 'hls'],
                 'player_skip': ['js', 'configs'],
-                'player_client': ['android', 'web'],
+                'player_client': ['android', 'web', 'ios', 'tv_embedded'],
             }
         },
-        # Configuraciones adicionales
         'socket_timeout': 30,
         'retries': 3,
         'fragment_retries': 3,
@@ -243,11 +174,12 @@ def get_ydl_opts(additional_opts=None):
         'age_limit': None,
         'prefer_insecure': False,
     }
-    
     if additional_opts:
         base_opts.update(additional_opts)
-    
     return base_opts
+
+
+# Reforzar estrategias para usar noplaylist
 
 def extract_with_fallback(url):
     """Intenta extraer información del video con múltiples estrategias"""
@@ -259,7 +191,7 @@ def extract_with_fallback(url):
         get_ydl_opts({
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android'],
+                    'player_client': ['android', 'ios'],
                     'skip': ['dash'],
                 }
             }
@@ -269,9 +201,10 @@ def extract_with_fallback(url):
         {
             'quiet': True,
             'no_warnings': True,
+            'noplaylist': True,
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'web'],
+                    'player_client': ['android', 'web', 'tv_embedded'],
                 }
             }
         },
@@ -279,6 +212,7 @@ def extract_with_fallback(url):
         # Estrategia 4: Solo extracción básica
         {
             'quiet': True,
+            'noplaylist': True,
             'extract_flat': False,
         }
     ]
@@ -300,6 +234,7 @@ def extract_with_fallback(url):
     # Si todas las estrategias fallan
     raise Exception("No se pudo obtener información del video después de intentar múltiples estrategias")
 
+
 def get_video_info_hybrid(url):
     """Método híbrido: API de YouTube primero, fallback a yt-dlp"""
     # Verificar si es YouTube
@@ -317,10 +252,12 @@ def get_video_info_hybrid(url):
     ydl_info = extract_with_fallback(url)
     return ydl_info, False  # False indica que vino de yt-dlp
 
+
 @app.route('/')
 def index():
     """Página principal"""
     return render_template('index.html')
+
 
 @app.route('/api/video-info', methods=['POST'])
 def get_video_info():
@@ -387,137 +324,288 @@ def get_video_info():
     except Exception as e:
         return jsonify({'error': f'Error al obtener información del video: {str(e)}'}), 500
 
-def get_download_format(quality, format_type):
-    """Determina el formato de descarga más compatible"""
-    if format_type == 'mp3':
-        return 'bestaudio/best'
-    
-    # Para video, usar formatos más específicos y compatibles
-    format_options = {
-        'best': 'best[height<=720]/best[height<=480]/best',
-        'worst': 'worst[height>=360]/worst',
-        '720': '720p/best[height<=720]/best',
-        '480': '480p/best[height<=480]/best',
-        'bestaudio': 'bestaudio/best',
-    }
-    
-    return format_options.get(quality, 'best[height<=480]/best')
 
-@app.route('/api/download', methods=['POST'])
-def download_video():
-    """Inicia la descarga del video"""
+# === Selector de formato directo ===
+
+def _pick_direct_format(info_dict, quality: str, format_type: str):
+    # Si ya es una sola URL
+    if info_dict.get('url') and not info_dict.get('formats'):
+        return {
+            'url': info_dict['url'],
+            'ext': info_dict.get('ext', 'mp4'),
+            'format_id': info_dict.get('format_id', 'direct'),
+            'height': info_dict.get('height'),
+            'acodec': info_dict.get('acodec'),
+            'vcodec': info_dict.get('vcodec')
+        }
+    formats = info_dict.get('formats') or []
+    if not formats:
+        raise Exception('No hay formatos disponibles para enlace directo')
+    def is_progressive(f):
+        return (f.get('vcodec') and f.get('vcodec') != 'none') and (f.get('acodec') and f.get('acodec') != 'none')
+    def is_audio_only(f):
+        return (f.get('acodec') and f.get('acodec') != 'none') and (not f.get('vcodec') or f.get('vcodec') == 'none')
+    def height_of(f):
+        return f.get('height') or 0
+    if format_type in ('mp3', 'audio', 'bestaudio'):
+        audio_formats = [f for f in formats if is_audio_only(f)]
+        audio_formats.sort(key=lambda f: (0 if (f.get('ext') in ('m4a', 'mp4', 'aac', 'mp3')) else 1, -(f.get('abr') or f.get('tbr') or 0)))
+        if audio_formats:
+            return audio_formats[0]
+        prog_fallback = [f for f in formats if is_progressive(f)]
+        if prog_fallback:
+            prog_fallback.sort(key=lambda f: (height_of(f), f.get('ext') != 'mp4'))
+            return prog_fallback[0]
+        raise Exception('No se encontró formato de audio directo')
+    progressive = [f for f in formats if is_progressive(f)]
+    if quality not in ('best', 'worst', '720', '480', 'bestaudio'):
+        exact = next((f for f in formats if f.get('format_id') == quality), None)
+        if exact:
+            return exact
+    if progressive:
+        if quality == 'worst':
+            progressive.sort(key=lambda f: (height_of(f), f.get('ext') != 'mp4'))
+            return progressive[0]
+        if quality in ('720', '480'):
+            target = int(quality)
+            below = [f for f in progressive if height_of(f) and height_of(f) <= target]
+            if below:
+                below.sort(key=lambda f: (-(height_of(f)), f.get('ext') != 'mp4'))
+                return below[0]
+            above = [f for f in progressive if height_of(f) and height_of(f) > target]
+            if above:
+                above.sort(key=lambda f: (height_of(f), f.get('ext') != 'mp4'))
+                return above[0]
+        progressive.sort(key=lambda f: (-(height_of(f)), f.get('ext') != 'mp4', -(f.get('tbr') or 0)))
+        return progressive[0]
+    formats_sorted = sorted(formats, key=lambda f: (-(height_of(f)), f.get('ext') != 'mp4', -(f.get('tbr') or 0)))
+    if formats_sorted:
+        return formats_sorted[0]
+    raise Exception('No fue posible seleccionar un formato directo')
+
+
+# === Endpoint: devolver URL directa ===
+
+@app.route('/api/direct-url', methods=['POST'])
+def direct_url():
     try:
-        data = request.get_json()
+        data = request.get_json() or {}
         url = data.get('url')
-        quality = data.get('quality', 'best')
-        format_type = data.get('format', 'mp4')
-        
+        quality = str(data.get('quality', 'best'))
+        format_type = str(data.get('format', 'mp4')).lower()
         if not url or not is_valid_url(url):
             return jsonify({'error': 'URL no válida'}), 400
-        
-        # Generar ID único para la descarga
-        download_id = str(int(time.time() * 1000))
-        
-        # Configurar opciones de descarga más agresivas para YouTube
-        ydl_opts = {
-            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-            'progress_hooks': [ProgressHook(download_id)],
-            'quiet': True,
-            'no_warnings': True,
-            # Configuraciones específicas para YouTube más agresivas
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android', 'web', 'ios'],
-                    'skip': ['hls', 'dash'],
-                    'player_skip': ['js'],
-                }
-            },
-            # Headers más agresivos
-            'http_headers': {
-                'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
-                'Accept': '*/*',
-                'Accept-Language': 'en-US,en;q=0.9',
-            },
-            # Configurar formato basado en parámetros
-            'format': get_download_format(quality, format_type),
-        }
-        
-        # Agregar postprocessor para MP3
-        if format_type == 'mp3':
-            ydl_opts['postprocessors'] = [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '192',
-            }]
-        
-        def download_thread():
-            try:
-                # Intentar método principal primero
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-            except Exception as e:
-                logger.warning(f"Método principal falló: {str(e)}")
-                # Intentar métodos alternativos
-                success = try_alternative_download(url, download_id)
-                if not success:
-                    download_progress[download_id] = {
-                        'status': 'error',
-                        'error': 'No se pudo descargar el video después de intentar múltiples métodos'
-                    }
-        
-        # Iniciar descarga en hilo separado
-        thread = threading.Thread(target=download_thread)
-        thread.daemon = True
-        thread.start()
-        
-        # Inicializar progreso
-        download_progress[download_id] = {
-            'status': 'starting',
-            'percent': '0%',
-            'speed': '0B/s'
-        }
-        
-        return jsonify({'download_id': download_id})
-        
+        url = normalize_url(url)
+        # Reutilizar la extracción robusta que ya funciona en /api/video-info
+        info = extract_with_fallback(url)
+        selected = _pick_direct_format(info, quality, format_type)
+        direct = selected.get('url')
+        if not direct:
+            raise Exception('No se obtuvo URL directa del formato seleccionado')
+        title = (info.get('title') or 'video').strip()
+        safe_title = re.sub(r'[\\/:*?"<>|]+', '_', title).strip('_.') or 'video'
+        ext = selected.get('ext') or ('m4a' if format_type in ('mp3', 'audio', 'bestaudio') else 'mp4')
+        return jsonify({
+            'direct_url': direct,
+            'filename': f"{safe_title}.{ext}",
+            'ext': ext,
+            'format_id': selected.get('format_id'),
+            'height': selected.get('height'),
+            'source': 'yt_dlp'
+        })
     except Exception as e:
-        return jsonify({'error': f'Error al iniciar descarga: {str(e)}'}), 500
+        logger.error(f"Error al obtener enlace directo: {str(e)}")
+        return jsonify({'error': f'No se pudo obtener enlace directo: {str(e)}'}), 400
 
-@app.route('/api/progress/<download_id>')
-def get_progress(download_id):
-    """Obtiene el progreso de una descarga específica"""
-    progress = download_progress.get(download_id, {'status': 'not_found'})
-    return jsonify(progress)
 
-@app.route('/api/downloads')
-def list_downloads():
-    """Lista todos los archivos descargados"""
+# === Búsqueda por nombre ===
+
+def youtube_search_api(query: str, max_results: int = 10):
+    """Busca videos por nombre usando la API de YouTube y devuelve una lista de resultados estándar."""
     try:
-        files = []
-        if os.path.exists(DOWNLOAD_DIR):
-            for filename in os.listdir(DOWNLOAD_DIR):
-                filepath = os.path.join(DOWNLOAD_DIR, filename)
-                if os.path.isfile(filepath):
-                    files.append({
-                        'filename': filename,
-                        'size': os.path.getsize(filepath),
-                        'modified': os.path.getmtime(filepath)
+        api_key = os.getenv('YOUTUBE_API_KEY')
+        if not api_key or api_key == 'your_youtube_api_key_here':
+            return None
+        youtube = build('youtube', 'v3', developerKey=api_key)
+        search_resp = youtube.search().list(
+            q=query, part='snippet', type='video', maxResults=max_results
+        ).execute()
+        video_ids = [item['id']['videoId'] for item in search_resp.get('items', []) if item['id'].get('videoId')]
+        if not video_ids:
+            return []
+        videos_resp = youtube.videos().list(
+            id=','.join(video_ids), part='snippet,contentDetails,statistics'
+        ).execute()
+        results = []
+        for item in videos_resp.get('items', []):
+            vid = item['id']
+            sn = item['snippet']
+            cd = item['contentDetails']
+            duration_seconds = parse_duration(cd.get('duration', 'PT0S'))
+            thumb = (sn.get('thumbnails', {}).get('high') or sn.get('thumbnails', {}).get('default') or {}).get('url', '')
+            results.append({
+                'title': sn.get('title'),
+                'uploader': sn.get('channelTitle'),
+                'duration': duration_seconds,
+                'thumbnail': thumb,
+                'video_id': vid,
+                'video_url': f'https://www.youtube.com/watch?v={vid}',
+                'platform': 'youtube'
+            })
+        return results
+    except Exception as e:
+        logger.error(f"Error en youtube_search_api: {e}")
+        return []
+
+
+# === Nuevo: búsqueda por artista (canal) ===
+
+def youtube_search_by_artist(query: str, max_results: int = 10):
+    """Busca canales por nombre y devuelve videos del/los canal(es) mejor coincidencia."""
+    try:
+        api_key = os.getenv('YOUTUBE_API_KEY')
+        if not api_key or api_key == 'your_youtube_api_key_here':
+            return None
+        youtube = build('youtube', 'v3', developerKey=api_key)
+        # 1) Buscar canales que coincidan con el artista
+        channels_resp = youtube.search().list(q=query, part='snippet', type='channel', maxResults=3).execute()
+        channel_ids = [it['id']['channelId'] for it in channels_resp.get('items', []) if it['id'].get('channelId')]
+        if not channel_ids:
+            return []
+        # 2) Traer videos de esos canales (relevancia)
+        video_ids = []
+        for ch in channel_ids:
+            videos = youtube.search().list(part='snippet', channelId=ch, type='video', maxResults=min(10, max_results), order='relevance').execute()
+            video_ids.extend([vi['id']['videoId'] for vi in videos.get('items', []) if vi['id'].get('videoId')])
+            if len(video_ids) >= max_results:
+                break
+        video_ids = video_ids[:max_results]
+        if not video_ids:
+            return []
+        details = youtube.videos().list(id=','.join(video_ids), part='snippet,contentDetails,statistics').execute()
+        results = []
+        for item in details.get('items', []):
+            vid = item['id']
+            sn = item['snippet']
+            cd = item['contentDetails']
+            duration_seconds = parse_duration(cd.get('duration', 'PT0S'))
+            thumb = (sn.get('thumbnails', {}).get('high') or sn.get('thumbnails', {}).get('default') or {}).get('url', '')
+            results.append({
+                'title': sn.get('title'),
+                'uploader': sn.get('channelTitle'),
+                'duration': duration_seconds,
+                'thumbnail': thumb,
+                'video_id': vid,
+                'video_url': f'https://www.youtube.com/watch?v={vid}',
+                'platform': 'youtube'
+            })
+        # Ordenar por vistas descendente si están disponibles
+        results.sort(key=lambda r: int(next((it['statistics'].get('viewCount', 0) for it in details.get('items', []) if it['id']==r['video_id']), 0)), reverse=True)
+        return results
+    except Exception as e:
+        logger.error(f"Error en youtube_search_by_artist: {e}")
+        return []
+
+
+def yt_dlp_search(query: str, max_results: int = 10):
+    """Fallback: usa yt-dlp 'ytsearch' para obtener resultados cuando no hay API."""
+    try:
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{max_results}:{query}", download=False)
+            entries = info.get('entries') or []
+            results = []
+            for e in entries:
+                if not e:
+                    continue
+                vid = e.get('id') or e.get('video_id')
+                if not vid:
+                    continue
+                results.append({
+                    'title': e.get('title'),
+                    'uploader': e.get('uploader') or e.get('channel') or '',
+                    'duration': e.get('duration') or 0,
+                    'thumbnail': e.get('thumbnail') or '',
+                    'video_id': vid,
+                    'video_url': e.get('webpage_url') or f'https://www.youtube.com/watch?v={vid}',
+                    'platform': 'youtube'
+                })
+            return results
+    except Exception as e:
+        logger.error(f"Error en yt_dlp_search: {e}")
+        return []
+
+
+# Nuevo: fallback para artista usando yt-dlp
+
+def yt_dlp_search_by_artist(query: str, max_results: int = 10):
+    try:
+        # Traer más resultados y priorizar por coincidencia en uploader
+        ydl_opts = {'quiet': True, 'no_warnings': True}
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f"ytsearch{max_results*3}:{query}", download=False)
+            entries = info.get('entries') or []
+            qlower = query.lower()
+            filtered = []
+            for e in entries:
+                up = (e.get('uploader') or e.get('channel') or '').lower()
+                if qlower in up:
+                    vid = e.get('id') or e.get('video_id')
+                    if not vid:
+                        continue
+                    filtered.append({
+                        'title': e.get('title'),
+                        'uploader': e.get('uploader') or e.get('channel') or '',
+                        'duration': e.get('duration') or 0,
+                        'thumbnail': e.get('thumbnail') or '',
+                        'video_id': vid,
+                        'video_url': e.get('webpage_url') or f'https://www.youtube.com/watch?v={vid}',
+                        'platform': 'youtube'
                     })
-        
-        return jsonify({'files': files})
+                if len(filtered) >= max_results:
+                    break
+            return filtered[:max_results]
     except Exception as e:
-        return jsonify({'error': f'Error al listar descargas: {str(e)}'}), 500
+        logger.error(f"Error en yt_dlp_search_by_artist: {e}")
+        return []
 
-@app.route('/api/download-file/<filename>')
-def download_file(filename):
-    """Descarga un archivo específico"""
+
+@app.route('/api/search', methods=['POST'])
+def search_videos():
+    """Busca videos por nombre. Usa YouTube API si está disponible; soporta 'type': 'video' o 'artist'."""
     try:
-        filepath = os.path.join(DOWNLOAD_DIR, filename)
-        if os.path.exists(filepath):
-            return send_file(filepath, as_attachment=True)
+        data = request.get_json() or {}
+        query = (data.get('query') or '').strip()
+        max_results = int(data.get('maxResults', 10))
+        search_type = (data.get('type') or 'video').lower()
+        if not query:
+            return jsonify({'error': 'Falta query'}), 400
+        source = 'youtube_api'
+        if search_type == 'artist':
+            results = youtube_search_by_artist(query, max_results)
+            if results is None:
+                results = yt_dlp_search_by_artist(query, max_results)
+                source = 'yt_dlp'
+            elif isinstance(results, list) and len(results) == 0:
+                fb = yt_dlp_search_by_artist(query, max_results)
+                if fb:
+                    results = fb
+                    source = 'yt_dlp'
         else:
-            return jsonify({'error': 'Archivo no encontrado'}), 404
+            results = youtube_search_api(query, max_results)
+            if results is None:
+                results = yt_dlp_search(query, max_results)
+                source = 'yt_dlp'
+            elif isinstance(results, list) and len(results) == 0:
+                fb = yt_dlp_search(query, max_results)
+                if fb:
+                    results = fb
+                    source = 'yt_dlp'
+        return jsonify({'results': results or [], 'source': source})
     except Exception as e:
-        return jsonify({'error': f'Error al descargar archivo: {str(e)}'}), 500
+        logger.error(f"Error en /api/search: {e}")
+        return jsonify({'error': f'No se pudo buscar: {str(e)}'}), 500
+
 
 if __name__ == '__main__':
     # Configuración para desarrollo y producción
