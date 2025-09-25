@@ -13,6 +13,7 @@ import logging
 from datetime import datetime
 import requests
 from googleapiclient.discovery import build
+import subprocess
 
 # Cargar variables de entorno
 load_dotenv()
@@ -149,6 +150,59 @@ def parse_duration(duration_str):
     seconds = int(match.group(3) or 0)
     
     return hours * 3600 + minutes * 60 + seconds
+
+def try_alternative_download(url, download_id):
+    """Intenta descarga usando métodos alternativos"""
+    try:
+        # Método 1: Intentar con yt-dlp usando cookies del navegador
+        logger.info("Intentando descarga con cookies del sistema...")
+        
+        # Configuración ultra-agresiva
+        ydl_opts = {
+            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
+            'format': 'best[height<=480]/worst',
+            'progress_hooks': [ProgressHook(download_id)],
+            'quiet': True,
+            'cookies_from_browser': ('chrome',),  # Usar cookies de Chrome
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['tv_embedded', 'android'],
+                    'skip': ['dash', 'hls'],
+                }
+            },
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            return True
+            
+    except Exception as e:
+        logger.warning(f"Método cookies falló: {str(e)}")
+        
+    try:
+        # Método 2: Usar cliente TV embedded (menos restrictivo)
+        logger.info("Intentando con cliente TV embedded...")
+        
+        ydl_opts = {
+            'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
+            'format': 'worst[height<=360]/worst',
+            'progress_hooks': [ProgressHook(download_id)],
+            'quiet': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['tv_embedded'],
+                }
+            },
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+            return True
+            
+    except Exception as e:
+        logger.warning(f"Método TV embedded falló: {str(e)}")
+        
+    return False
 
 def get_ydl_opts(additional_opts=None):
     """Obtiene configuración estándar de yt-dlp con headers anti-bot avanzados"""
@@ -398,13 +452,18 @@ def download_video():
         
         def download_thread():
             try:
+                # Intentar método principal primero
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
             except Exception as e:
-                download_progress[download_id] = {
-                    'status': 'error',
-                    'error': str(e)
-                }
+                logger.warning(f"Método principal falló: {str(e)}")
+                # Intentar métodos alternativos
+                success = try_alternative_download(url, download_id)
+                if not success:
+                    download_progress[download_id] = {
+                        'status': 'error',
+                        'error': 'No se pudo descargar el video después de intentar múltiples métodos'
+                    }
         
         # Iniciar descarga en hilo separado
         thread = threading.Thread(target=download_thread)
