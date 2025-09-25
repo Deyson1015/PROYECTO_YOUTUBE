@@ -80,33 +80,100 @@ def is_valid_url(url):
     return re.match(youtube_pattern, url) or re.match(tiktok_pattern, url)
 
 def get_ydl_opts(additional_opts=None):
-    """Obtiene configuración estándar de yt-dlp con headers anti-bot"""
+    """Obtiene configuración estándar de yt-dlp con headers anti-bot avanzados"""
     base_opts = {
         'quiet': True,
         'no_warnings': True,  
         'ignoreerrors': False,
-        # Configuración para evitar detección de bot
-        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        # Headers más actualizados para simular navegador real
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'referer': 'https://www.youtube.com/',
         'http_headers': {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'en-us,en;q=0.5',
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'DNT': '1',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
             'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0',
         },
-        # Configuraciones adicionales anti-bot
+        # Configuraciones más agresivas anti-bot
         'extractor_args': {
             'youtube': {
                 'skip': ['dash', 'hls'],
-                'player_skip': ['configs'],
+                'player_skip': ['js', 'configs'],
+                'player_client': ['android', 'web'],
             }
         },
+        # Configuraciones adicionales
+        'socket_timeout': 30,
+        'retries': 3,
+        'fragment_retries': 3,
+        'extract_flat': False,
+        'age_limit': None,
+        'prefer_insecure': False,
     }
     
     if additional_opts:
         base_opts.update(additional_opts)
     
     return base_opts
+
+def extract_with_fallback(url):
+    """Intenta extraer información del video con múltiples estrategias"""
+    strategies = [
+        # Estrategia 1: Configuración estándar
+        get_ydl_opts(),
+        
+        # Estrategia 2: Cliente móvil
+        get_ydl_opts({
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android'],
+                    'skip': ['dash'],
+                }
+            }
+        }),
+        
+        # Estrategia 3: Configuración mínima
+        {
+            'quiet': True,
+            'no_warnings': True,
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web'],
+                }
+            }
+        },
+        
+        # Estrategia 4: Solo extracción básica
+        {
+            'quiet': True,
+            'extract_flat': False,
+        }
+    ]
+    
+    for i, opts in enumerate(strategies):
+        try:
+            logger.info(f"Intentando estrategia {i+1} para URL: {url}")
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                logger.info(f"Éxito con estrategia {i+1}")
+                return info
+        except yt_dlp.utils.DownloadError as e:
+            logger.warning(f"Estrategia {i+1} falló: {str(e)}")
+            continue
+        except Exception as e:
+            logger.warning(f"Error inesperado en estrategia {i+1}: {str(e)}")
+            continue
+    
+    # Si todas las estrategias fallan
+    raise Exception("No se pudo obtener información del video después de intentar múltiples estrategias")
 
 @app.route('/')
 def index():
@@ -123,56 +190,50 @@ def get_video_info():
         if not url or not is_valid_url(url):
             return jsonify({'error': 'URL no válida'}), 400
         
-        ydl_opts = get_ydl_opts()
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            try:
-                info = ydl.extract_info(url, download=False)
+        try:
+            info = extract_with_fallback(url)
+            
+            video_info = {
+                'title': info.get('title', 'Sin título'),
+                'duration': info.get('duration', 0),
+                'uploader': info.get('uploader', 'Desconocido'),
+                'thumbnail': info.get('thumbnail', ''),
+                'formats': []
+            }
+            
+            # Siempre proporcionar formatos básicos que funcionan
+            video_info['formats'] = [
+                {'format_id': 'best', 'ext': 'mp4', 'quality': 'Mejor calidad disponible', 'filesize': 0},
+                {'format_id': 'worst', 'ext': 'mp4', 'quality': 'Menor calidad', 'filesize': 0},
+                {'format_id': 'bestaudio', 'ext': 'mp3', 'quality': 'Solo audio (MP3)', 'filesize': 0}
+            ]
+            
+            # Intentar obtener formatos específicos si están disponibles
+            if 'formats' in info and info['formats']:
+                additional_formats = []
+                seen_qualities = set()
                 
-                video_info = {
-                    'title': info.get('title', 'Sin título'),
-                    'duration': info.get('duration', 0),
-                    'uploader': info.get('uploader', 'Desconocido'),
-                    'thumbnail': info.get('thumbnail', ''),
-                    'formats': []
-                }
+                for f in info['formats']:
+                    if f.get('vcodec') and f.get('vcodec') != 'none':
+                        height = f.get('height')
+                        if height and height not in seen_qualities and height <= 1080:
+                            additional_formats.append({
+                                'format_id': f.get('format_id'),
+                                'ext': f.get('ext', 'mp4'),
+                                'quality': f"{height}p" if height else f.get('format_note', 'Desconocido'),
+                                'filesize': f.get('filesize', 0)
+                            })
+                            seen_qualities.add(height)
                 
-                # Siempre proporcionar formatos básicos que funcionan
-                video_info['formats'] = [
-                    {'format_id': 'best', 'ext': 'mp4', 'quality': 'Mejor calidad disponible', 'filesize': 0},
-                    {'format_id': 'worst', 'ext': 'mp4', 'quality': 'Menor calidad', 'filesize': 0},
-                    {'format_id': 'bestaudio', 'ext': 'mp3', 'quality': 'Solo audio (MP3)', 'filesize': 0}
-                ]
-                
-                # Intentar obtener formatos específicos si están disponibles
-                if 'formats' in info and info['formats']:
-                    additional_formats = []
-                    seen_qualities = set()
-                    
-                    for f in info['formats']:
-                        if f.get('vcodec') and f.get('vcodec') != 'none':
-                            height = f.get('height')
-                            if height and height not in seen_qualities and height <= 1080:
-                                additional_formats.append({
-                                    'format_id': f.get('format_id'),
-                                    'ext': f.get('ext', 'mp4'),
-                                    'quality': f"{height}p" if height else f.get('format_note', 'Desconocido'),
-                                    'filesize': f.get('filesize', 0)
-                                })
-                                seen_qualities.add(height)
-                    
-                    # Agregar formatos adicionales si se encontraron
-                    if additional_formats:
-                        video_info['formats'].extend(additional_formats[:3])  # Max 3 adicionales
-                
-                return jsonify(video_info)
-                
-            except yt_dlp.utils.DownloadError as e:
-                logger.error(f"Error de descarga yt-dlp: {str(e)}")
-                return jsonify({'error': f'Video no disponible o privado: {str(e)}'}), 400
-            except Exception as e:
-                logger.error(f"Error al extraer info: {str(e)}")
-                return jsonify({'error': f'Error al procesar el video: {str(e)}'}), 500
+                # Agregar formatos adicionales si se encontraron
+                if additional_formats:
+                    video_info['formats'].extend(additional_formats[:3])  # Max 3 adicionales
+            
+            return jsonify(video_info)
+            
+        except Exception as e:
+            logger.error(f"Error al extraer info: {str(e)}")
+            return jsonify({'error': f'Video no disponible o bloqueado: {str(e)}'}), 400
             
     except Exception as e:
         return jsonify({'error': f'Error al obtener información del video: {str(e)}'}), 500
