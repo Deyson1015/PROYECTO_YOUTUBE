@@ -79,6 +79,35 @@ def is_valid_url(url):
     
     return re.match(youtube_pattern, url) or re.match(tiktok_pattern, url)
 
+def get_ydl_opts(additional_opts=None):
+    """Obtiene configuración estándar de yt-dlp con headers anti-bot"""
+    base_opts = {
+        'quiet': True,
+        'no_warnings': True,  
+        'ignoreerrors': False,
+        # Configuración para evitar detección de bot
+        'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'referer': 'https://www.youtube.com/',
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'en-us,en;q=0.5',
+            'Sec-Fetch-Mode': 'navigate',
+        },
+        # Configuraciones adicionales anti-bot
+        'extractor_args': {
+            'youtube': {
+                'skip': ['dash', 'hls'],
+                'player_skip': ['configs'],
+            }
+        },
+    }
+    
+    if additional_opts:
+        base_opts.update(additional_opts)
+    
+    return base_opts
+
 @app.route('/')
 def index():
     """Página principal"""
@@ -94,11 +123,7 @@ def get_video_info():
         if not url or not is_valid_url(url):
             return jsonify({'error': 'URL no válida'}), 400
         
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,  
-            'ignoreerrors': False,
-        }
+        ydl_opts = get_ydl_opts()
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             try:
@@ -167,14 +192,12 @@ def download_video():
         # Generar ID único para la descarga
         download_id = str(int(time.time() * 1000))
         
-        # Configurar opciones de descarga con formatos más flexibles
-        ydl_opts = {
+        # Configurar opciones de descarga con formatos más flexibles y anti-bot
+        ydl_opts = get_ydl_opts({
             'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
             'format': quality if quality in ['best', 'worst', 'bestaudio'] else f'{quality}/best',
             'progress_hooks': [ProgressHook(download_id)],
-            'ignoreerrors': False,
-            'no_warnings': True,
-        }
+        })
         
         # Configurar formato específico
         if format_type == 'mp3':
