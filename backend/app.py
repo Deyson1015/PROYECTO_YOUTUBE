@@ -96,11 +96,8 @@ def get_video_info():
         
         ydl_opts = {
             'quiet': True,
-            'no_warnings': True,
-            'extractflat': False,
-            'format': 'best[height<=720]/best',  # Limitar calidad para evitar problemas
+            'no_warnings': True,  
             'ignoreerrors': False,
-            'extract_flat': False,
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -115,24 +112,33 @@ def get_video_info():
                     'formats': []
                 }
                 
-                # Obtener formatos disponibles - método más robusto
+                # Siempre proporcionar formatos básicos que funcionan
+                video_info['formats'] = [
+                    {'format_id': 'best', 'ext': 'mp4', 'quality': 'Mejor calidad disponible', 'filesize': 0},
+                    {'format_id': 'worst', 'ext': 'mp4', 'quality': 'Menor calidad', 'filesize': 0},
+                    {'format_id': 'bestaudio', 'ext': 'mp3', 'quality': 'Solo audio (MP3)', 'filesize': 0}
+                ]
+                
+                # Intentar obtener formatos específicos si están disponibles
                 if 'formats' in info and info['formats']:
-                    # Filtrar y agregar formatos de video
+                    additional_formats = []
+                    seen_qualities = set()
+                    
                     for f in info['formats']:
                         if f.get('vcodec') and f.get('vcodec') != 'none':
-                            video_info['formats'].append({
-                                'format_id': f.get('format_id'),
-                                'ext': f.get('ext', 'mp4'),
-                                'quality': f.get('format_note', f.get('height', 'Desconocido')),
-                                'filesize': f.get('filesize', 0)
-                            })
-                
-                # Si no hay formatos específicos, agregar opciones básicas
-                if not video_info['formats']:
-                    video_info['formats'] = [
-                        {'format_id': 'best', 'ext': 'mp4', 'quality': 'Mejor calidad', 'filesize': 0},
-                        {'format_id': 'worst', 'ext': 'mp4', 'quality': 'Menor calidad', 'filesize': 0}
-                    ]
+                            height = f.get('height')
+                            if height and height not in seen_qualities and height <= 1080:
+                                additional_formats.append({
+                                    'format_id': f.get('format_id'),
+                                    'ext': f.get('ext', 'mp4'),
+                                    'quality': f"{height}p" if height else f.get('format_note', 'Desconocido'),
+                                    'filesize': f.get('filesize', 0)
+                                })
+                                seen_qualities.add(height)
+                    
+                    # Agregar formatos adicionales si se encontraron
+                    if additional_formats:
+                        video_info['formats'].extend(additional_formats[:3])  # Max 3 adicionales
                 
                 return jsonify(video_info)
                 
@@ -161,13 +167,13 @@ def download_video():
         # Generar ID único para la descarga
         download_id = str(int(time.time() * 1000))
         
-        # Configurar opciones de descarga
+        # Configurar opciones de descarga con formatos más flexibles
         ydl_opts = {
             'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-            'format': 'best[height<=720]/best' if quality == 'best' else quality,
+            'format': quality if quality in ['best', 'worst', 'bestaudio'] else f'{quality}/best',
             'progress_hooks': [ProgressHook(download_id)],
             'ignoreerrors': False,
-            'no_warnings': False,
+            'no_warnings': True,
         }
         
         # Configurar formato específico
