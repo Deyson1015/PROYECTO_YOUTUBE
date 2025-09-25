@@ -1,1 +1,1 @@
-web: gunicorn backend.app:app --bind 0.0.0.0:$PORT --workers 1 --worker-class gthread --threads 2 --timeout 300 --keep-alive 2 --max-requests 1000
+web: gunicorn backend.app:app --host 0.0.0.0 --port $PORT

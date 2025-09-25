@@ -1,23 +1,14 @@
-# Configuración específica para Render
-type = "web"
-name = "video-downloader"
-env = "python"
-buildCommand = "pip install -r requirements.txt"
-startCommand = "gunicorn backend.app:app --bind 0.0.0.0:$PORT"
-
-# Variables de entorno para Render
-[env]
-PYTHON_VERSION = "3.11.5"
-PORT = "10000"
-FLASK_ENV = "production"
-
-# Configuración de salud
-[health]
-path = "/"
-port = "PORT"
-
-# Configuración de recursos
-[resources]
+services:
+  - type: web
+    name: video-downloader
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn backend.app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.11.9"
+      - key: FLASK_ENV
+        value: production
 cpu = 0.25
 memory = "256MB"
 
