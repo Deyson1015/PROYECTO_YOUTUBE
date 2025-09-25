@@ -7,6 +7,8 @@ import re
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 import logging
 from googleapiclient.discovery import build
+import base64
+import tempfile
 
 # Cargar variables de entorno
 load_dotenv()
@@ -37,6 +39,26 @@ app.config['SECRET_KEY'] = os.getenv('SECRET_KEY', 'dev-key-change-in-production
 app.config['MAX_CONTENT_LENGTH'] = int(os.getenv('MAX_FILE_SIZE', 52428800))  # 50MB
 
 logger.info("Aplicación iniciada (modo playlist, sin endpoints de descarga)")
+
+# === Config de cookies para YouTube (para evitar bloqueos/429) ===
+COOKIEFILE_PATH = None
+COOKIE_HEADER_STR = None
+try:
+    if os.getenv('YT_COOKIES_FILE') and os.path.exists(os.getenv('YT_COOKIES_FILE')):
+        COOKIEFILE_PATH = os.getenv('YT_COOKIES_FILE')
+        logger.info('Usando cookies Netscape desde YT_COOKIES_FILE')
+    elif os.getenv('YT_COOKIES_B64'):
+        raw = base64.b64decode(os.getenv('YT_COOKIES_B64')).decode('utf-8', errors='ignore')
+        tmp_path = os.path.join(tempfile.gettempdir(), 'yt_cookies.txt')
+        with open(tmp_path, 'w', encoding='utf-8') as f:
+            f.write(raw)
+        COOKIEFILE_PATH = tmp_path
+        logger.info('Usando cookies Netscape desde YT_COOKIES_B64 (archivo temporal)')
+    if os.getenv('YT_COOKIES_HEADER'):
+        COOKIE_HEADER_STR = os.getenv('YT_COOKIES_HEADER')  # cadena "key=value; key2=value2"
+        logger.info('Añadiendo cabecera Cookie desde YT_COOKIES_HEADER')
+except Exception as e:
+    logger.warning(f'No se pudo preparar cookies: {e}')
 
 
 def is_valid_url(url):
@@ -143,7 +165,6 @@ def get_ydl_opts(additional_opts=None):
         'no_warnings': True,  
         'ignoreerrors': False,
         'noplaylist': True,
-        # Headers más actualizados para simular navegador real
         'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
         'referer': 'https://www.youtube.com/',
         'http_headers': {
@@ -174,7 +195,19 @@ def get_ydl_opts(additional_opts=None):
         'age_limit': None,
         'prefer_insecure': False,
     }
+
+    # Inyectar cookies si están configuradas
+    if COOKIEFILE_PATH:
+        base_opts['cookiefile'] = COOKIEFILE_PATH
+    if COOKIE_HEADER_STR:
+        base_opts.setdefault('http_headers', {})['Cookie'] = COOKIE_HEADER_STR
+
     if additional_opts:
+        # Combinar headers si hay adicionales
+        if 'http_headers' in additional_opts:
+            merged = base_opts.get('http_headers', {}).copy()
+            merged.update(additional_opts['http_headers'])
+            additional_opts = {**additional_opts, 'http_headers': merged}
         base_opts.update(additional_opts)
     return base_opts
 
@@ -187,34 +220,36 @@ def extract_with_fallback(url):
         # Estrategia 1: Configuración estándar
         get_ydl_opts(),
         
-        # Estrategia 2: Cliente móvil
+        # Estrategia 2: Cliente móvil + cookies forzadas
         get_ydl_opts({
             'extractor_args': {
                 'youtube': {
                     'player_client': ['android', 'ios'],
                     'skip': ['dash'],
                 }
+            },
+            'http_headers': {
+                # Forzar referer y posible Cookie ya incluida
+                'Referer': 'https://www.youtube.com/'
             }
         }),
         
-        # Estrategia 3: Configuración mínima
-        {
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
+        # Estrategia 3: Cliente TV embedded (suele evadir algunos bloqueos)
+        get_ydl_opts({
             'extractor_args': {
                 'youtube': {
-                    'player_client': ['android', 'web', 'tv_embedded'],
+                    'player_client': ['tv_embedded'],
+                    'skip': ['dash']
                 }
+            },
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (CrKey armv7l 1.36.159268) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.0 Safari/537.36 CrKey/1.36.159268',
+                'Referer': 'https://www.youtube.com/'
             }
-        },
+        }),
         
-        # Estrategia 4: Solo extracción básica
-        {
-            'quiet': True,
-            'noplaylist': True,
-            'extract_flat': False,
-        }
+        # Estrategia 4: Básica
+        get_ydl_opts({ 'extract_flat': False })
     ]
     
     for i, opts in enumerate(strategies):
