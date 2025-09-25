@@ -333,6 +333,22 @@ def get_video_info():
     except Exception as e:
         return jsonify({'error': f'Error al obtener información del video: {str(e)}'}), 500
 
+def get_download_format(quality, format_type):
+    """Determina el formato de descarga más compatible"""
+    if format_type == 'mp3':
+        return 'bestaudio/best'
+    
+    # Para video, usar formatos más específicos y compatibles
+    format_options = {
+        'best': 'best[height<=720]/best[height<=480]/best',
+        'worst': 'worst[height>=360]/worst',
+        '720': '720p/best[height<=720]/best',
+        '480': '480p/best[height<=480]/best',
+        'bestaudio': 'bestaudio/best',
+    }
+    
+    return format_options.get(quality, 'best[height<=480]/best')
+
 @app.route('/api/download', methods=['POST'])
 def download_video():
     """Inicia la descarga del video"""
@@ -348,23 +364,37 @@ def download_video():
         # Generar ID único para la descarga
         download_id = str(int(time.time() * 1000))
         
-        # Configurar opciones de descarga con formatos más flexibles y anti-bot
-        ydl_opts = get_ydl_opts({
+        # Configurar opciones de descarga más agresivas para YouTube
+        ydl_opts = {
             'outtmpl': os.path.join(DOWNLOAD_DIR, '%(title)s.%(ext)s'),
-            'format': quality if quality in ['best', 'worst', 'bestaudio'] else f'{quality}/best',
             'progress_hooks': [ProgressHook(download_id)],
-        })
+            'quiet': True,
+            'no_warnings': True,
+            # Configuraciones específicas para YouTube más agresivas
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android', 'web', 'ios'],
+                    'skip': ['hls', 'dash'],
+                    'player_skip': ['js'],
+                }
+            },
+            # Headers más agresivos
+            'http_headers': {
+                'User-Agent': 'com.google.android.youtube/17.36.4 (Linux; U; Android 12; GB) gzip',
+                'Accept': '*/*',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
+            # Configurar formato basado en parámetros
+            'format': get_download_format(quality, format_type),
+        }
         
-        # Configurar formato específico
+        # Agregar postprocessor para MP3
         if format_type == 'mp3':
-            ydl_opts.update({
-                'format': 'bestaudio/best',
-                'postprocessors': [{
-                    'key': 'FFmpegExtractAudio',
-                    'preferredcodec': 'mp3',
-                    'preferredquality': '192',
-                }],
-            })
+            ydl_opts['postprocessors'] = [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }]
         
         def download_thread():
             try:
