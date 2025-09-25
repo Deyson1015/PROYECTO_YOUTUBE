@@ -6,3 +6,4 @@ gunicorn
 python-dotenv
 pycryptodome
 mutagen
+google-api-python-client

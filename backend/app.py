@@ -11,6 +11,8 @@ import threading
 import time
 import logging
 from datetime import datetime
+import requests
+from googleapiclient.discovery import build
 
 # Cargar variables de entorno
 load_dotenv()
@@ -78,6 +80,75 @@ def is_valid_url(url):
     tiktok_pattern = r'(https?://)?(www\.|vm\.)?tiktok\.com/'
     
     return re.match(youtube_pattern, url) or re.match(tiktok_pattern, url)
+
+def extract_youtube_id(url):
+    """Extrae el ID del video de YouTube de una URL"""
+    patterns = [
+        r'(?:v=|\/)([0-9A-Za-z_-]{11}).*',
+        r'(?:embed\/)([0-9A-Za-z_-]{11})',
+        r'(?:watch\?v=)([0-9A-Za-z_-]{11})',
+        r'youtu\.be\/([0-9A-Za-z_-]{11})',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return None
+
+def get_youtube_info_api(video_id):
+    """Obtiene información del video usando la API oficial de YouTube"""
+    try:
+        api_key = os.getenv('YOUTUBE_API_KEY')
+        if not api_key or api_key == 'your_youtube_api_key_here':
+            logger.warning("YouTube API key no configurada, usando método alternativo")
+            return None
+        
+        youtube = build('youtube', 'v3', developerKey=api_key)
+        
+        request = youtube.videos().list(
+            part='snippet,contentDetails,statistics',
+            id=video_id
+        )
+        
+        response = request.execute()
+        
+        if not response['items']:
+            return None
+        
+        video = response['items'][0]
+        snippet = video['snippet']
+        
+        # Convertir duración ISO 8601 a segundos
+        duration_str = video['contentDetails']['duration']
+        duration_seconds = parse_duration(duration_str)
+        
+        return {
+            'title': snippet['title'],
+            'duration': duration_seconds,
+            'uploader': snippet['channelTitle'],
+            'thumbnail': snippet['thumbnails'].get('maxres', snippet['thumbnails']['high'])['url'],
+            'description': snippet.get('description', ''),
+            'view_count': video['statistics'].get('viewCount', 0)
+        }
+        
+    except Exception as e:
+        logger.error(f"Error al usar YouTube API: {str(e)}")
+        return None
+
+def parse_duration(duration_str):
+    """Convierte duración ISO 8601 (PT4M13S) a segundos"""
+    import re
+    pattern = r'PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?'
+    match = re.match(pattern, duration_str)
+    if not match:
+        return 0
+    
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2) or 0) 
+    seconds = int(match.group(3) or 0)
+    
+    return hours * 3600 + minutes * 60 + seconds
 
 def get_ydl_opts(additional_opts=None):
     """Obtiene configuración estándar de yt-dlp con headers anti-bot avanzados"""
@@ -175,6 +246,23 @@ def extract_with_fallback(url):
     # Si todas las estrategias fallan
     raise Exception("No se pudo obtener información del video después de intentar múltiples estrategias")
 
+def get_video_info_hybrid(url):
+    """Método híbrido: API de YouTube primero, fallback a yt-dlp"""
+    # Verificar si es YouTube
+    if 'youtube.com' in url or 'youtu.be' in url:
+        video_id = extract_youtube_id(url)
+        if video_id:
+            logger.info(f"Intentando YouTube API para video ID: {video_id}")
+            api_info = get_youtube_info_api(video_id)
+            if api_info:
+                logger.info("Éxito con YouTube API")
+                return api_info, True  # True indica que vino de API
+    
+    # Fallback a yt-dlp para YouTube sin API o TikTok
+    logger.info("Usando fallback yt-dlp")
+    ydl_info = extract_with_fallback(url)
+    return ydl_info, False  # False indica que vino de yt-dlp
+
 @app.route('/')
 def index():
     """Página principal"""
@@ -191,14 +279,15 @@ def get_video_info():
             return jsonify({'error': 'URL no válida'}), 400
         
         try:
-            info = extract_with_fallback(url)
+            info, from_api = get_video_info_hybrid(url)
             
             video_info = {
                 'title': info.get('title', 'Sin título'),
                 'duration': info.get('duration', 0),
                 'uploader': info.get('uploader', 'Desconocido'),
                 'thumbnail': info.get('thumbnail', ''),
-                'formats': []
+                'formats': [],
+                'source': 'youtube_api' if from_api else 'yt_dlp'
             }
             
             # Siempre proporcionar formatos básicos que funcionan
@@ -208,8 +297,14 @@ def get_video_info():
                 {'format_id': 'bestaudio', 'ext': 'mp3', 'quality': 'Solo audio (MP3)', 'filesize': 0}
             ]
             
-            # Intentar obtener formatos específicos si están disponibles
-            if 'formats' in info and info['formats']:
+            # Si viene de API, agregar formatos predefinidos
+            if from_api:
+                video_info['formats'].extend([
+                    {'format_id': '720', 'ext': 'mp4', 'quality': '720p HD', 'filesize': 0},
+                    {'format_id': '480', 'ext': 'mp4', 'quality': '480p SD', 'filesize': 0},
+                ])
+            # Si viene de yt-dlp, intentar obtener formatos específicos
+            elif 'formats' in info and info['formats']:
                 additional_formats = []
                 seen_qualities = set()
                 
